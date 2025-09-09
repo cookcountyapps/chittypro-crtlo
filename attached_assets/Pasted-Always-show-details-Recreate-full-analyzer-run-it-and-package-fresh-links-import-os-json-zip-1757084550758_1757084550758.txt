@@ -1,0 +1,562 @@
+Always show details
+
+# Recreate full analyzer, run it, and package fresh links.
+import os, json, zipfile, subprocess, sqlite3, pandas as pd
+from textwrap import dedent
+
+BASE_DIR = "/mnt/data/imessage_kit"
+OUT_DIR = "/mnt/data/imessage_out"
+os.makedirs(BASE_DIR, exist_ok=True)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+CODE_PATH = os.path.join(BASE_DIR, "imessage_analyzer.py")
+README_PATH = os.path.join(BASE_DIR, "README.md")
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+INPUT_TXT = "/mnt/data/Lulu Arias.txt"
+
+code = r"""
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import argparse, os, re, sqlite3, csv, json, math
+from datetime import datetime
+from collections import Counter
+
+HEADER_RE = re.compile(r'^(?P<sender>.+?) - (?P<month>[A-Za-z]{3,9}) (?P<day>\d{1,2}), (?P<year>\d{4}) at (?P<time>\d{1,2}:\d{2} (?:AM|PM)) - iMessage$')
+REPLY_RE = re.compile(r'^\d+ Replies?$')
+EDITED_RE = re.compile(r'^Message edited on .*')
+DAY_SEP_RE = re.compile(r'^[A-Za-z]{3} \d{1,2}, \d{4}$')
+TRUNCATION_NOTE_RE = re.compile(r'^The file is too long and.*', re.IGNORECASE)
+
+STOPWORDS = set('''a an the and or but if then else when while for to of in on with without into out up down over under from by as is are am be been being do does did done have has had i you he she it we they them me my your his her our their this that these those there here not no yes ok okay gonna wanna gotta just like so very more most much many few lot lots really actually literally please thanks thank u ur lol lmao omg idk btw im its dont cant wont wasnt couldnt shouldnt isnt yall'''.split())
+PUNCT_TRANS = str.maketrans({c: ' ' for c in '''.,!?;:"'`~@#$%^&*()[]{}<>/\\|+-_=—–…\u2019\u2018\u201c\u201d'''})
+
+def norm_text(s: str) -> str:
+    return s.lower().translate(PUNCT_TRANS)
+
+def cheap_stem(token: str) -> str:
+    for suf in ['ing','edly','ed','ly','ies','s']:
+        if token.endswith(suf) and len(token) > len(suf)+2:
+            return token[:-len(suf)]
+    return token
+
+def tokens(s: str):
+    for tok in norm_text(s).split():
+        if tok.isdigit() or tok in STOPWORDS:
+            continue
+        yield cheap_stem(tok)
+
+def ngrams(seq, n):
+    seq = list(seq)
+    for i in range(len(seq)-n+1):
+        yield tuple(seq[i:i+n])
+
+def _read_lines_any_encoding(path):
+    encodings = ['utf-8', 'utf-16', 'utf-16-le', 'utf-16-be']
+    for enc in encodings:
+        try:
+            with open(path, 'r', encoding=enc) as f:
+                head = f.read(2048)
+                if not head:
+                    return []
+                if '\x00' in head and enc == 'utf-8':
+                    continue
+            with open(path, 'r', encoding=enc) as f2:
+                return [line.rstrip('\n') for line in f2]
+        except Exception:
+            continue
+    with open(path, 'rb') as fb:
+        data = fb.read()
+    try:
+        return data.decode('utf-16', errors='ignore').splitlines()
+    except Exception:
+        return data.decode('utf-8', errors='ignore').splitlines()
+
+def parse_imessage_txt(path):
+    messages = []
+    current = None
+    def flush():
+        nonlocal current, messages
+        if current:
+            body = '\n'.join(current["lines"]).strip()
+            if body and not REPLY_RE.match(body) and not TRUNCATION_NOTE_RE.match(body):
+                current["body"] = body
+                messages.append(current)
+        current = None
+    for line in _read_lines_any_encoding(path):
+        if not line.strip():
+            continue
+        m = HEADER_RE.match(line.strip())
+        if m:
+            flush()
+            month = m.group('month')
+            day = int(m.group('day')); year = int(m.group('year')); time_s = m.group('time')
+            try:
+                dt = datetime.strptime(f'{month} {day}, {year} {time_s}', '%b %d, %Y %I:%M %p')
+            except ValueError:
+                dt = datetime.strptime(f'{month} {day}, {year} {time_s}', '%B %d, %Y %I:%M %p')
+            sender = m.group('sender').strip()
+            sender_norm = 'You' if sender.lower().startswith('you') else sender
+            current = {"sender_raw": sender, "sender": sender_norm, "ts": dt.isoformat(), "lines": [], "edited": False}
+            continue
+        if EDITED_RE.match(line):
+            if current: current["edited"] = True
+            continue
+        if REPLY_RE.match(line) or DAY_SEP_RE.match(line):
+            continue
+        if current is None:
+            continue
+        current["lines"].append(line)
+    flush()
+    return messages
+
+def build_db(outdir):
+    os.makedirs(outdir, exist_ok=True)
+    db_path = os.path.join(outdir, 'imessage_analysis.sqlite')
+    if os.path.exists(db_path): os.remove(db_path)
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+    cur.execute('PRAGMA journal_mode=WAL;')
+    cur.execute('CREATE TABLE participants (id INTEGER PRIMARY KEY, name TEXT UNIQUE);')
+    cur.execute('''CREATE TABLE messages (
+        id INTEGER PRIMARY KEY,
+        participant_id INTEGER,
+        sender TEXT, ts TEXT, body TEXT, edited INTEGER DEFAULT 0,
+        FOREIGN KEY(participant_id) REFERENCES participants(id)
+    );''')
+    cur.execute('CREATE VIRTUAL TABLE messages_fts USING fts5(body, content="messages", content_rowid="id");')
+    cur.execute('CREATE TABLE topics (id INTEGER PRIMARY KEY, label TEXT, seed TEXT, n INTEGER);')
+    cur.execute('CREATE TABLE message_topics (message_id INTEGER, topic_id INTEGER, score REAL, PRIMARY KEY(message_id, topic_id));')
+    cur.execute('CREATE TABLE psych_tags (id INTEGER PRIMARY KEY, tag TEXT, description TEXT);')
+    cur.execute('CREATE TABLE message_psych (message_id INTEGER, tag_id INTEGER, hit TEXT, PRIMARY KEY(message_id, tag_id, hit));')
+    con.commit()
+    return con
+
+def upsert_participant(cur, name):
+    cur.execute('INSERT OR IGNORE INTO participants(name) VALUES (?)', (name,))
+    cur.execute('SELECT id FROM participants WHERE name=?', (name,))
+    return cur.fetchone()[0]
+
+def fill_db(con, messages):
+    cur = con.cursor()
+    for msg in messages:
+        pid = upsert_participant(cur, msg['sender'])
+        cur.execute('INSERT INTO messages(participant_id, sender, ts, body, edited) VALUES (?,?,?,?,?)',
+                    (pid, msg['sender'], msg['ts'], msg.get('body',''), 1 if msg.get('edited') else 0))
+        mid = cur.lastrowid
+        cur.execute('INSERT INTO messages_fts(rowid, body) VALUES (?,?)', (mid, msg.get('body','')))
+    con.commit()
+
+def extract_topics(con, top_k=40, min_df=20, max_kgram=3):
+    cur = con.cursor()
+    cur.execute('SELECT id, body FROM messages;')
+    docs = cur.fetchall()
+    df_counts = Counter(); tf_counts = Counter(); doc_ngrams = []
+    def toks(body): return list(tokens(body))
+    for mid, body in docs:
+        t = toks(body); grams = set()
+        for n in range(1, max_kgram+1):
+            grams |= set(tuple(g) for g in ngrams(t, n))
+        doc_ngrams.append((mid, grams))
+        for g in grams: df_counts[g] += 1
+        for n in range(1, max_kgram+1):
+            for g in ngrams(t, n): tf_counts[tuple(g)] += 1
+    N = max(1, len(docs))
+    scored = []
+    for g, tf in tf_counts.items():
+        df = df_counts.get(g, 1)
+        if df < min_df: continue
+        idf = math.log((N+1)/(df+1)) + 1.0
+        scored.append((tf*idf, g, tf, df))
+    scored.sort(reverse=True)
+    chosen = []
+    for score, g, tf, df in scored:
+        if any(set(g).issubset(set(cg)) for _, cg, _, _ in chosen): continue
+        chosen.append((score, g, tf, df))
+        if len(chosen) >= top_k: break
+    topics = []
+    for score, g, tf, df in chosen:
+        label = ' '.join(g)
+        cur.execute('INSERT INTO topics(label, seed, n) VALUES (?,?,0)', (label, label))
+        topics.append((cur.lastrowid, g))
+    con.commit()
+    for mid, grams in doc_ngrams:
+        for tid, g in topics:
+            if set(g).issubset(grams):
+                cur.execute('INSERT OR IGNORE INTO message_topics(message_id, topic_id, score) VALUES (?,?,?)', (mid, tid, len(g)))
+    cur.execute('UPDATE topics SET n=(SELECT COUNT(*) FROM message_topics WHERE topic_id=topics.id);')
+    con.commit()
+
+def get_psych_lexicon():
+    return {
+        "persuasion_reciprocity": {"description":"Cialdini reciprocity cues","keywords":["favor","return","owed","gift","do same","help you","help me","in return","pay back","payback"]},
+        "persuasion_commitment": {"description":"Cialdini commitment/consistency","keywords":["promise","commit","agreement","as agreed","you said","we said","deadline","schedule","as planned"]},
+        "persuasion_authority": {"description":"Cialdini authority","keywords":["policy","law","contract","manager","officer","official","rule","terms","agreement","lease"]},
+        "persuasion_scarcity": {"description":"Cialdini scarcity/urgency","keywords":["limited","last chance","deadline","only one","scarce","urgent","now or never","final","expire"]},
+        "gottman_criticism": {"description":"Gottman criticism markers","keywords":["you always","you never","why are you","what's wrong with you","lazy","stupid","retard","idiot","hate you"]},
+        "gottman_contempt": {"description":"Gottman contempt markers","keywords":["disgusting","pathetic","worthless","trash","loser","moron","eye roll","sarcasm"]},
+        "gottman_defensiveness": {"description":"Gottman defensiveness markers","keywords":["not my fault","i didn't","you started","that's not true","you're wrong"]},
+        "gottman_stonewalling": {"description":"Gottman stonewalling markers","keywords":["fine.","whatever.","k.","ok.","leave me alone","stop texting","not talking","done here"]},
+        "affection_support": {"description":"Affection and support","keywords":["love you","miss you","thank you","appreciate","proud of you","hug","kiss","❤️","❤"]},
+        "logistics_planning": {"description":"Logistics and scheduling","keywords":["arrive","deliver","time","tomorrow","today","morning","afternoon","night","move in","meeting","schedule","coming","going"]},
+        "finance_money": {"description":"Payments, refunds, costs","keywords":["refund","deposit","rent","pay","payment","wire","zelle","venmo","credit","reimburse","cost","fee"]},
+        "housing_lease": {"description":"Housing and lease terms","keywords":["lease","tenant","unit","move-in","habitable","landlord","addendum","apartment","renovation","keys"]},
+        "conflict_language": {"description":"Profanity or conflict language","keywords":["fuck","shit","hate","idiot","retard","pissed","stupid","moron","fucking"]},
+    }
+
+def load_config(config_path):
+    if config_path and os.path.exists(config_path):
+        with open(config_path, 'r', encoding='utf-8') as f: return json.load(f)
+    return {}
+
+def apply_psych_tags(con, config_path):
+    cfg = load_config(config_path)
+    lex = get_psych_lexicon()
+    lex.update(cfg.get("psych_lexicon", {}))
+    cur = con.cursor()
+    tags = {}
+    for tag, meta in lex.items():
+        cur.execute('INSERT INTO psych_tags(tag, description) VALUES (?,?)', (tag, meta.get("description","")))
+        tags[tag] = cur.lastrowid
+    con.commit()
+    cur.execute('SELECT id, body FROM messages;')
+    for mid, body in cur.fetchall():
+        body_l = (body or "").lower()
+        for tag, meta in lex.items():
+            for kw in set(meta.get("keywords", [])):
+                if kw.lower() in body_l:
+                    cur.execute('INSERT OR IGNORE INTO message_psych(message_id, tag_id, hit) VALUES (?,?,?)', (mid, tags[tag], kw))
+    con.commit()
+
+def export_csvs(con, outdir):
+    cur = con.cursor()
+    with open(os.path.join(outdir, 'messages.csv'), 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f); w.writerow(['id','sender','ts','body','edited'])
+        for row in cur.execute('SELECT id, sender, ts, body, edited FROM messages ORDER BY ts'):
+            w.writerow(row)
+    with open(os.path.join(outdir, 'topics.csv'), 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f); w.writerow(['id','label','seed','message_count'])
+        for row in cur.execute('SELECT id, label, seed, n FROM topics ORDER BY n DESC, id'):
+            w.writerow(row)
+    with open(os.path.join(outdir, 'message_topics.csv'), 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f); w.writerow(['message_id','topic_id','score'])
+        for row in cur.execute('SELECT message_id, topic_id, score FROM message_topics ORDER BY message_id, score DESC'):
+            w.writerow(row)
+    with open(os.path.join(outdir, 'psych_tags.csv'), 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f); w.writerow(['id','tag','description'])
+        for row in cur.execute('SELECT id, tag, description FROM psych_tags ORDER BY id'):
+            w.writerow(row)
+    with open(os.path.join(outdir, 'message_psych.csv'), 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f); w.writerow(['message_id','tag_id','hit'])
+        for row in cur.execute('SELECT message_id, tag_id, hit FROM message_psych ORDER BY message_id'):
+            w.writerow(row)
+
+def build_views(con):
+    cur = con.cursor()
+    cur.execute('DROP VIEW IF EXISTS v_messages;')
+    cur.execute('CREATE VIEW v_messages AS SELECT m.id, datetime(m.ts) as ts, p.name as sender, m.body, m.edited FROM messages m JOIN participants p ON p.id = m.participant_id')
+    cur.execute('DROP VIEW IF EXISTS v_topics;')
+    cur.execute('CREATE VIEW v_topics AS SELECT t.id, t.label, t.seed, t.n FROM topics t ORDER BY t.n DESC')
+    cur.execute('DROP VIEW IF EXISTS v_message_topics;')
+    cur.execute('CREATE VIEW v_message_topics AS SELECT mt.message_id, mt.topic_id, t.label, mt.score FROM message_topics mt JOIN topics t ON t.id = mt.topic_id ORDER BY mt.message_id, mt.score DESC')
+    cur.execute('DROP VIEW IF EXISTS v_message_psych;')
+    cur.execute('CREATE VIEW v_message_psych AS SELECT mp.message_id, pt.tag, pt.description, mp.hit FROM message_psych mp JOIN psych_tags pt ON pt.id = mp.tag_id ORDER BY mp.message_id')
+    con.commit()
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--input', required=True); ap.add_argument('--outdir', required=True)
+    ap.add_argument('--top_k', type=int, default=40); ap.add_argument('--min_df', type=int, default=20); ap.add_argument('--max_kgram', type=int, default=3)
+    ap.add_argument('--config', default=None)
+    args = ap.parse_args()
+    os.makedirs(args.outdir, exist_ok=True)
+    messages = parse_imessage_txt(args.input)
+    with open(os.path.join(args.outdir, 'ingest_stats.json'), 'w', encoding='utf-8') as f:
+        json.dump({"messages_parsed": len(messages)}, f, indent=2)
+    con = build_db(args.outdir)
+    fill_db(con, messages)
+    extract_topics(con, top_k=args.top_k, min_df=args.min_df, max_kgram=args.max_kgram)
+    apply_psych_tags(con, args.config)
+    build_views(con)
+    export_csvs(con, args.outdir)
+    print(f'Parsed {len(messages)} messages.')
+    print('Outputs ready in', args.outdir)
+
+if __name__ == "__main__":
+    main()
+"""
+
+with open(CODE_PATH, "w", encoding="utf-8") as f:
+    f.write(code)
+
+readme = dedent("""
+# iMessage Analyzer
+Run:
+python imessage_analyzer.py --input "/mnt/data/Lulu Arias.txt" --outdir "/mnt/data/imessage_out" --top_k 60 --min_df 10 --max_kgram 3
+Always show details
+
+Artifacts: SQLite DB with FTS, topics, psych tags, and CSVs.
+""")
+with open(README_PATH, "w", encoding="utf-8") as f:
+    f.write(readme)
+
+with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+    json.dump({"psych_lexicon": {}}, f, indent=2)
+
+# Execute
+run = subprocess.run(
+    ["python", CODE_PATH, "--input", INPUT_TXT, "--outdir", OUT_DIR, "--top_k", "60", "--min_df", "10", "--max_kgram", "3"],
+    capture_output=True, text=True
+)
+print(run.stdout[:1000])
+if run.stderr:
+    print(run.stderr[:500])
+
+# Zip
+zip_path = "/mnt/data/imessage_toolkit.zip"
+with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+    for p in [CODE_PATH, README_PATH, CONFIG_PATH]:
+        z.write(p, arcname=os.path.relpath(p, "/mnt/data"))
+    for root, _, files in os.walk(OUT_DIR):
+        for f in files:
+            fp = os.path.join(root, f)
+            z.write(fp, arcname=os.path.relpath(fp, "/mnt/data"))
+
+print("Zip:", zip_path)
+
+Thought for 6s
+Links expire in this UI. Copy the code below locally. It’s the full working analyzer.
+imessage_analyzer.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import argparse, os, re, sqlite3, csv, json, math
+from datetime import datetime
+from collections import Counter
+
+HEADER_RE = re.compile(r'^(?P<sender>.+?) - (?P<month>[A-Za-z]{3,9}) (?P<day>\d{1,2}), (?P<year>\d{4}) at (?P<time>\d{1,2}:\d{2} (?:AM|PM)) - iMessage$')
+REPLY_RE = re.compile(r'^\d+ Replies?$')
+EDITED_RE = re.compile(r'^Message edited on .*')
+DAY_SEP_RE = re.compile(r'^[A-Za-z]{3} \d{1,2}, \d{4}$')
+TRUNCATION_NOTE_RE = re.compile(r'^The file is too long and.*', re.IGNORECASE)
+
+STOPWORDS = set('''a an the and or but if then else when while for to of in on with without into out up down over under from by as is are am be been being do does did done have has had i you he she it we they them me my your his her our their this that these those there here not no yes ok okay gonna wanna gotta just like so very more most much many few lot lots really actually literally please thanks thank u ur lol lmao omg idk btw im its dont cant wont wasnt couldnt shouldnt isnt yall'''.split())
+PUNCT_TRANS = str.maketrans({c: ' ' for c in '''.,!?;:"'`~@#$%^&*()[]{}<>/\\|+-_=—–…\u2019\u2018\u201c\u201d'''})
+
+def norm_text(s): return s.lower().translate(PUNCT_TRANS)
+def cheap_stem(t):
+    for suf in ['ing','edly','ed','ly','ies','s']:
+        if t.endswith(suf) and len(t) > len(suf)+2: return t[:-len(suf)]
+    return t
+def tokens(s):
+    for tok in norm_text(s).split():
+        if tok.isdigit() or tok in STOPWORDS: continue
+        yield cheap_stem(tok)
+def ngrams(seq, n):
+    seq = list(seq)
+    for i in range(len(seq)-n+1): yield tuple(seq[i:i+n])
+
+def _read_lines_any_encoding(path):
+    for enc in ['utf-8', 'utf-16', 'utf-16-le', 'utf-16-be']:
+        try:
+            with open(path, 'r', encoding=enc) as f:
+                head = f.read(2048)
+                if head and not ('\x00' in head and enc=='utf-8'):
+                    with open(path, 'r', encoding=enc) as f2:
+                        return [line.rstrip('\n') for line in f2]
+        except Exception: pass
+    with open(path,'rb') as fb: data = fb.read()
+    try: return data.decode('utf-16','ignore').splitlines()
+    except Exception: return data.decode('utf-8','ignore').splitlines()
+
+def parse_imessage_txt(path):
+    messages, current = [], None
+    def flush():
+        nonlocal current
+        if current:
+            body = '\n'.join(current["lines"]).strip()
+            if body and not REPLY_RE.match(body) and not TRUNCATION_NOTE_RE.match(body):
+                current["body"] = body; messages.append(current)
+        current = None
+    for line in _read_lines_any_encoding(path):
+        if not line.strip(): continue
+        m = HEADER_RE.match(line.strip())
+        if m:
+            flush()
+            month, day, year, time_s = m.group('month'), int(m.group('day')), int(m.group('year')), m.group('time')
+            try: dt = datetime.strptime(f'{month} {day}, {year} {time_s}', '%b %d, %Y %I:%M %p')
+            except ValueError: dt = datetime.strptime(f'{month} {day}, {year} {time_s}', '%B %d, %Y %I:%M %p')
+            sender = m.group('sender').strip()
+            current = {"sender_raw": sender, "sender": 'You' if sender.lower().startswith('you') else sender,
+                       "ts": dt.isoformat(), "lines": [], "edited": False}
+            continue
+        if EDITED_RE.match(line): 
+            if current: current["edited"]=True
+            continue
+        if REPLY_RE.match(line) or DAY_SEP_RE.match(line): continue
+        if current is None: continue
+        current["lines"].append(line)
+    flush()
+    return messages
+
+def build_db(outdir):
+    os.makedirs(outdir, exist_ok=True)
+    db = os.path.join(outdir,'imessage_analysis.sqlite')
+    if os.path.exists(db): os.remove(db)
+    con = sqlite3.connect(db); cur = con.cursor()
+    cur.execute('PRAGMA journal_mode=WAL;')
+    cur.execute('CREATE TABLE participants (id INTEGER PRIMARY KEY, name TEXT UNIQUE);')
+    cur.execute('''CREATE TABLE messages (
+        id INTEGER PRIMARY KEY,
+        participant_id INTEGER, sender TEXT, ts TEXT, body TEXT, edited INTEGER DEFAULT 0,
+        FOREIGN KEY(participant_id) REFERENCES participants(id));''')
+    cur.execute('CREATE VIRTUAL TABLE messages_fts USING fts5(body, content="messages", content_rowid="id");')
+    cur.execute('CREATE TABLE topics (id INTEGER PRIMARY KEY, label TEXT, seed TEXT, n INTEGER);')
+    cur.execute('CREATE TABLE message_topics (message_id INTEGER, topic_id INTEGER, score REAL, PRIMARY KEY(message_id, topic_id));')
+    cur.execute('CREATE TABLE psych_tags (id INTEGER PRIMARY KEY, tag TEXT, description TEXT);')
+    cur.execute('CREATE TABLE message_psych (message_id INTEGER, tag_id INTEGER, hit TEXT, PRIMARY KEY(message_id, tag_id, hit));')
+    con.commit(); return con
+
+def upsert_participant(cur,name):
+    cur.execute('INSERT OR IGNORE INTO participants(name) VALUES (?)',(name,))
+    cur.execute('SELECT id FROM participants WHERE name=?',(name,)); return cur.fetchone()[0]
+
+def fill_db(con, messages):
+    cur = con.cursor()
+    for msg in messages:
+        pid = upsert_participant(cur, msg['sender'])
+        cur.execute('INSERT INTO messages(participant_id,sender,ts,body,edited) VALUES (?,?,?,?,?)',
+                    (pid,msg['sender'],msg['ts'],msg.get('body',''),1 if msg.get('edited') else 0))
+        mid = cur.lastrowid
+        cur.execute('INSERT INTO messages_fts(rowid,body) VALUES (?,?)',(mid,msg.get('body','')))
+    con.commit()
+
+def extract_topics(con, top_k=40, min_df=20, max_kgram=3):
+    cur = con.cursor(); cur.execute('SELECT id,body FROM messages;'); docs = cur.fetchall()
+    df_counts, tf_counts, doc_ngrams = Counter(), Counter(), []
+    for mid, body in docs:
+        t = list(tokens(body)); grams=set()
+        for n in range(1,max_kgram+1): grams |= set(tuple(g) for g in ngrams(t,n))
+        doc_ngrams.append((mid,grams))
+        for g in grams: df_counts[g]+=1
+        for n in range(1,max_kgram+1):
+            for g in ngrams(t,n): tf_counts[tuple(g)]+=1
+    N = max(1,len(docs)); scored=[]
+    for g,tf in tf_counts.items():
+        df = df_counts.get(g,1)
+        if df < min_df: continue
+        scored.append((tf*(math.log((N+1)/(df+1))+1.0), g, tf, df))
+    scored.sort(reverse=True)
+    chosen=[]
+    for score,g,tf,df in scored:
+        if any(set(g).issubset(set(cg)) for _,cg,_,_ in chosen): continue
+        chosen.append((score,g,tf,df))
+        if len(chosen)>=top_k: break
+    topics=[]
+    for _,g,_,_ in chosen:
+        label=' '.join(g); cur.execute('INSERT INTO topics(label,seed,n) VALUES (?,?,0)',(label,label))
+        topics.append((cur.lastrowid,g))
+    con.commit()
+    for mid, grams in doc_ngrams:
+        for tid,g in topics:
+            if set(g).issubset(grams):
+                cur.execute('INSERT OR IGNORE INTO message_topics(message_id,topic_id,score) VALUES (?,?,?)',(mid,tid,len(g)))
+    cur.execute('UPDATE topics SET n=(SELECT COUNT(*) FROM message_topics WHERE topic_id=topics.id);'); con.commit()
+
+def get_psych_lexicon():
+    return {
+        "persuasion_reciprocity":{"description":"Cialdini reciprocity","keywords":["favor","return","owed","gift","do same","help you","help me","in return","pay back","payback"]},
+        "persuasion_commitment":{"description":"Cialdini commitment","keywords":["promise","commit","agreement","as agreed","you said","we said","deadline","schedule","as planned"]},
+        "persuasion_authority":{"description":"Cialdini authority","keywords":["policy","law","contract","manager","officer","official","rule","terms","agreement","lease"]},
+        "persuasion_scarcity":{"description":"Cialdini scarcity/urgency","keywords":["limited","last chance","deadline","only one","scarce","urgent","now or never","final","expire"]},
+        "gottman_criticism":{"description":"Gottman criticism","keywords":["you always","you never","why are you","what's wrong with you","lazy","stupid","retard","idiot","hate you"]},
+        "gottman_contempt":{"description":"Gottman contempt","keywords":["disgusting","pathetic","worthless","trash","loser","moron","eye roll","sarcasm"]},
+        "gottman_defensiveness":{"description":"Gottman defensiveness","keywords":["not my fault","i didn't","you started","that's not true","you're wrong"]},
+        "gottman_stonewalling":{"description":"Gottman stonewalling","keywords":["fine.","whatever.","k.","ok.","leave me alone","stop texting","not talking","done here"]},
+        "affection_support":{"description":"Affection/support","keywords":["love you","miss you","thank you","appreciate","proud of you","hug","kiss","❤️","❤"]},
+        "logistics_planning":{"description":"Logistics/scheduling","keywords":["arrive","deliver","time","tomorrow","today","morning","afternoon","night","move in","meeting","schedule","coming","going"]},
+        "finance_money":{"description":"Payments/costs","keywords":["refund","deposit","rent","pay","payment","wire","zelle","venmo","credit","reimburse","cost","fee"]},
+        "housing_lease":{"description":"Housing/lease","keywords":["lease","tenant","unit","move-in","habitable","landlord","addendum","apartment","renovation","keys"]},
+        "conflict_language":{"description":"Profanity/conflict","keywords":["fuck","shit","hate","idiot","retard","pissed","stupid","moron","fucking"]},
+    }
+
+def load_config(path):
+    if path and os.path.exists(path):
+        with open(path,'r',encoding='utf-8') as f: return json.load(f)
+    return {}
+
+def apply_psych_tags(con, config_path):
+    cur = con.cursor()
+    lex = get_psych_lexicon(); lex.update(load_config(config_path).get("psych_lexicon", {}))
+    tags={}
+    for tag,meta in lex.items():
+        cur.execute('INSERT INTO psych_tags(tag,description) VALUES (?,?)',(tag,meta.get("description",""))); tags[tag]=cur.lastrowid
+    con.commit()
+    cur.execute('SELECT id, body FROM messages;')
+    for mid, body in cur.fetchall():
+        body_l = (body or "").lower()
+        for tag,meta in lex.items():
+            for kw in set(meta.get("keywords", [])):
+                if kw.lower() in body_l:
+                    cur.execute('INSERT OR IGNORE INTO message_psych(message_id,tag_id,hit) VALUES (?,?,?)',(mid,tags[tag],kw))
+    con.commit()
+
+def export_csvs(con, outdir):
+    cur = con.cursor()
+    with open(os.path.join(outdir,'messages.csv'),'w',newline='',encoding='utf-8') as f:
+        w=csv.writer(f); w.writerow(['id','sender','ts','body','edited'])
+        for r in cur.execute('SELECT id,sender,ts,body,edited FROM messages ORDER BY ts'): w.writerow(r)
+    with open(os.path.join(outdir,'topics.csv'),'w',newline='',encoding='utf-8') as f:
+        w=csv.writer(f); w.writerow(['id','label','seed','message_count'])
+        for r in cur.execute('SELECT id,label,seed,n FROM topics ORDER BY n DESC,id'): w.writerow(r)
+    with open(os.path.join(outdir,'message_topics.csv'),'w',newline='',encoding='utf-8') as f:
+        w=csv.writer(f); w.writerow(['message_id','topic_id','score'])
+        for r in cur.execute('SELECT message_id,topic_id,score FROM message_topics ORDER BY message_id,score DESC'): w.writerow(r)
+    with open(os.path.join(outdir,'psych_tags.csv'),'w',newline='',encoding='utf-8') as f:
+        w=csv.writer(f); w.writerow(['id','tag','description'])
+        for r in cur.execute('SELECT id,tag,description FROM psych_tags ORDER BY id'): w.writerow(r)
+    with open(os.path.join(outdir,'message_psych.csv'),'w',newline='',encoding='utf-8') as f:
+        w=csv.writer(f); w.writerow(['message_id','tag_id','hit'])
+        for r in cur.execute('SELECT message_id,tag_id,hit FROM message_psych ORDER BY message_id'): w.writerow(r)
+
+def build_views(con):
+    cur = con.cursor()
+    cur.execute('DROP VIEW IF EXISTS v_messages;')
+    cur.execute('CREATE VIEW v_messages AS SELECT m.id, datetime(m.ts) ts, p.name sender, m.body, m.edited FROM messages m JOIN participants p ON p.id=m.participant_id')
+    cur.execute('DROP VIEW IF EXISTS v_topics;')
+    cur.execute('CREATE VIEW v_topics AS SELECT t.id, t.label, t.seed, t.n FROM topics t ORDER BY t.n DESC')
+    cur.execute('DROP VIEW IF EXISTS v_message_topics;')
+    cur.execute('CREATE VIEW v_message_topics AS SELECT mt.message_id, mt.topic_id, t.label, mt.score FROM message_topics mt JOIN topics t ON t.id=mt.topic_id ORDER BY mt.message_id, mt.score DESC')
+    cur.execute('DROP VIEW IF EXISTS v_message_psych;')
+    cur.execute('CREATE VIEW v_message_psych AS SELECT mp.message_id, pt.tag, pt.description, mp.hit FROM message_psych mp JOIN psych_tags pt ON pt.id=mp.tag_id ORDER BY mp.message_id')
+    con.commit()
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--input', required=True)
+    ap.add_argument('--outdir', required=True)
+    ap.add_argument('--top_k', type=int, default=40)
+    ap.add_argument('--min_df', type=int, default=20)
+    ap.add_argument('--max_kgram', type=int, default=3)
+    ap.add_argument('--config', default=None)
+    args = ap.parse_args()
+    os.makedirs(args.outdir, exist_ok=True)
+    messages = parse_imessage_txt(args.input)
+    with open(os.path.join(args.outdir,'ingest_stats.json'),'w',encoding='utf-8') as f:
+        json.dump({"messages_parsed": len(messages)}, f, indent=2)
+    con = build_db(args.outdir)
+    fill_db(con, messages)
+    extract_topics(con, top_k=args.top_k, min_df=args.min_df, max_kgram=args.max_kgram)
+    apply_psych_tags(con, args.config)
+    build_views(con)
+    export_csvs(con, args.outdir)
+    print(f'Parsed {len(messages)} messages. Outputs in {args.outdir}')
+
+if __name__ == '__main__': main()
+Run:
+python imessage_analyzer.py --input "/path/to/Lulu Arias.txt" --outdir "./imessage_out" --top_k 60 --min_df 10 --max_kgram 3
+Queries:
+SELECT * FROM v_topics LIMIT 20;
+SELECT m.* FROM v_messages m JOIN v_message_psych p ON p.message_id=m.id WHERE p.tag='finance_money' LIMIT 50;
+SELECT m.id, m.ts, m.sender, snippet(messages_fts,0,'[[',']]','…',10) snip
+FROM messages_fts JOIN messages m ON m.id=messages_fts.rowid
+WHERE messages_fts MATCH 'lease OR tenant' LIMIT 25;
+If you want this wrapped as a REST API or packaged as a Docker image, say so.
