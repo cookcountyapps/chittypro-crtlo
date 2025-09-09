@@ -7,13 +7,14 @@ import { useToast } from "@/hooks/use-toast";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import { isUnauthorizedError } from "@/lib/authUtils";
+import type { RTLOQuestion } from "@shared/schema";
 
 export default function RtloQA() {
   const [question, setQuestion] = useState("");
   const { toast } = useToast();
   const queryClient = useQueryClient();
 
-  const { data: questions, isLoading } = useQuery({
+  const { data: questions, isLoading } = useQuery<RTLOQuestion[]>({
     queryKey: ["/api/rtlo-questions"],
   });
 

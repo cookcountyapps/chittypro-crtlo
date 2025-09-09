@@ -4,19 +4,20 @@ import { Badge } from "@/components/ui/badge";
 import { useAuth } from "@/hooks/useAuth";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "wouter";
+import type { Property, RTLOQuestion, Document, AIAnalysis } from "@shared/schema";
 
 export default function Home() {
   const { user } = useAuth();
   
-  const { data: properties } = useQuery({
+  const { data: properties } = useQuery<Property[]>({
     queryKey: ["/api/properties"],
   });
 
-  const { data: recentQuestions } = useQuery({
+  const { data: recentQuestions } = useQuery<RTLOQuestion[]>({
     queryKey: ["/api/rtlo-questions"],
   });
 
-  const { data: documents } = useQuery({
+  const { data: documents } = useQuery<Document[]>({
     queryKey: ["/api/documents"],
   });
 

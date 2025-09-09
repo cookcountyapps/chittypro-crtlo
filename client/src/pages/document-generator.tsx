@@ -10,6 +10,7 @@ import { useToast } from "@/hooks/use-toast";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import { isUnauthorizedError } from "@/lib/authUtils";
+import type { Document, Property } from "@shared/schema";
 
 export default function DocumentGenerator() {
   const [formData, setFormData] = useState({
@@ -24,11 +25,11 @@ export default function DocumentGenerator() {
   const { toast } = useToast();
   const queryClient = useQueryClient();
 
-  const { data: documents, isLoading } = useQuery({
+  const { data: documents, isLoading } = useQuery<Document[]>({
     queryKey: ["/api/documents"],
   });
 
-  const { data: properties } = useQuery({
+  const { data: properties } = useQuery<Property[]>({
     queryKey: ["/api/properties"],
   });
 

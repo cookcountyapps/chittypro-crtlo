@@ -10,6 +10,7 @@ import { apiRequest } from "@/lib/queryClient";
 import { isUnauthorizedError } from "@/lib/authUtils";
 import { useAuth } from "@/hooks/useAuth";
 import { Link } from "wouter";
+import type { AIAnalysis } from "@shared/schema";
 
 export default function AIAnalysis() {
   const [leaseText, setLeaseText] = useState("");
@@ -17,7 +18,7 @@ export default function AIAnalysis() {
   const queryClient = useQueryClient();
   const { user } = useAuth();
 
-  const { data: analyses, isLoading } = useQuery({
+  const { data: analyses, isLoading } = useQuery<AIAnalysis[]>({
     queryKey: ["/api/ai-analyses"],
   });
 

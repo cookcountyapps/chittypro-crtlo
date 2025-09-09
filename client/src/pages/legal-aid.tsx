@@ -3,8 +3,18 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useQuery } from "@tanstack/react-query";
 
+interface LegalAidResource {
+  id: string;
+  name: string;
+  description: string;
+  phone?: string;
+  website?: string;
+  services: string[];
+  eligibility: string;
+}
+
 export default function LegalAid() {
-  const { data: legalAidResources, isLoading } = useQuery({
+  const { data: legalAidResources, isLoading } = useQuery<LegalAidResource[]>({
     queryKey: ["/api/legal-aid"],
   });
 

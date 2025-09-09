@@ -10,6 +10,7 @@ import { useToast } from "@/hooks/use-toast";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import { isUnauthorizedError } from "@/lib/authUtils";
+import type { Property } from "@shared/schema";
 
 export default function PropertyVerification() {
   const [formData, setFormData] = useState({
@@ -24,7 +25,7 @@ export default function PropertyVerification() {
   const { toast } = useToast();
   const queryClient = useQueryClient();
 
-  const { data: properties } = useQuery({
+  const { data: properties } = useQuery<Property[]>({
     queryKey: ["/api/properties"],
   });
 
