@@ -39,7 +39,7 @@ function Router() {
   );
 }
 
-function App() {
+function AppContent() {
   const { isAuthenticated, isLoading } = useAuth();
 
   // Custom sidebar width for the application
@@ -49,28 +49,34 @@ function App() {
   };
 
   return (
-    <QueryClientProvider client={queryClient}>
-      <TooltipProvider>
-        {!isLoading && isAuthenticated ? (
-          <SidebarProvider style={style as React.CSSProperties}>
-            <div className="flex h-screen w-full">
-              <AppSidebar />
-              <div className="flex flex-col flex-1">
-                <header className="flex items-center justify-between p-4 border-b bg-card">
-                  <SidebarTrigger data-testid="button-sidebar-toggle" />
-                  <div className="text-xl font-bold text-primary">ChittyPro</div>
-                </header>
-                <main className="flex-1 overflow-auto">
-                  <Router />
-                </main>
-              </div>
+    <TooltipProvider>
+      {!isLoading && isAuthenticated ? (
+        <SidebarProvider style={style as React.CSSProperties}>
+          <div className="flex h-screen w-full">
+            <AppSidebar />
+            <div className="flex flex-col flex-1">
+              <header className="flex items-center justify-between p-4 border-b bg-card">
+                <SidebarTrigger data-testid="button-sidebar-toggle" />
+                <div className="text-xl font-bold text-primary">ChittyPro</div>
+              </header>
+              <main className="flex-1 overflow-auto">
+                <Router />
+              </main>
             </div>
-          </SidebarProvider>
-        ) : (
-          <Router />
-        )}
-        <Toaster />
-      </TooltipProvider>
+          </div>
+        </SidebarProvider>
+      ) : (
+        <Router />
+      )}
+      <Toaster />
+    </TooltipProvider>
+  );
+}
+
+function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <AppContent />
     </QueryClientProvider>
   );
 }
